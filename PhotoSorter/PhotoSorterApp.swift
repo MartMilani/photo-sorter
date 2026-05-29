@@ -1,5 +1,40 @@
 import SwiftUI
 import Observation
+import AppKit
+
+/// Decodes and caches `NSImage`s off the main thread. A tiny LRU keeps the
+/// current image plus the one prefetched image (and the previous, for undo).
+actor ImageCache {
+    private var cache: [URL: NSImage] = [:]
+    private var order: [URL] = []
+    private let limit = 3
+
+    @discardableResult
+    func load(_ url: URL) -> NSImage? {
+        if let existing = cache[url] {
+            touch(url)
+            return existing
+        }
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        cache[url] = image
+        order.append(url)
+        trim()
+        return image
+    }
+
+    private func touch(_ url: URL) {
+        if let idx = order.firstIndex(of: url) {
+            order.remove(at: idx)
+            order.append(url)
+        }
+    }
+
+    private func trim() {
+        while order.count > limit {
+            cache.removeValue(forKey: order.removeFirst())
+        }
+    }
+}
 
 @main
 struct PhotoSorterApp: App {
@@ -21,8 +56,11 @@ final class SorterViewModel {
     var currentIndex: Int = 0
     var isComplete: Bool = false
 
+    let imageCache = ImageCache()
+
     private var undoStack: [(source: URL, destination: URL)] = []
     private var destinationFolderName: String = ""
+    private var prefetchTask: Task<Void, Never>?
 
     private let picturesURL = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask)[0]
 
@@ -33,6 +71,20 @@ final class SorterViewModel {
 
     var current: URL? {
         photos.indices.contains(currentIndex) ? photos[currentIndex] : nil
+    }
+
+    private var nextURL: URL? {
+        photos.indices.contains(currentIndex + 1) ? photos[currentIndex + 1] : nil
+    }
+
+    /// Decode the next image in the background so it's ready instantly when the
+    /// user advances. Only ever one prefetch is in flight at a time.
+    func prefetchNext() {
+        prefetchTask?.cancel()
+        guard let next = nextURL else { return }
+        prefetchTask = Task.detached(priority: .utility) { [imageCache] in
+            await imageCache.load(next)
+        }
     }
 
     var progress: String {

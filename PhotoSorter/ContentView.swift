@@ -71,7 +71,7 @@ struct SorterView: View {
             Color.black.ignoresSafeArea()
 
             if let url = vm.current {
-                PhotoView(url: url)
+                PhotoView(url: url, vm: vm)
                     .id(url)
             }
 
@@ -115,6 +115,7 @@ struct SorterView: View {
 
 struct PhotoView: View {
     let url: URL
+    var vm: SorterViewModel
     @State private var image: NSImage?
 
     var body: some View {
@@ -129,10 +130,8 @@ struct PhotoView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: url) {
-            image = nil
-            image = await Task.detached(priority: .userInitiated) {
-                NSImage(contentsOf: url)
-            }.value
+            image = await vm.imageCache.load(url)
+            vm.prefetchNext()
         }
     }
 }
