@@ -166,7 +166,16 @@ struct SorterView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { startListening() }
+        .onAppear {
+            startListening()
+            // Decode to the screen's longest edge in backing pixels — no point
+            // rasterizing larger than the display can show.
+            if let screen = NSScreen.main {
+                let scale = screen.backingScaleFactor
+                let longest = max(screen.frame.width, screen.frame.height) * scale
+                vm.maxPixelSize = Int(longest.rounded())
+            }
+        }
         .onDisappear { stopListening() }
     }
 
@@ -205,7 +214,7 @@ struct PhotoView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: url) {
-            image = await vm.imageCache.load(url)
+            image = await vm.imageCache.load(url, maxPixelSize: vm.maxPixelSize)
             vm.prefetchNext()
         }
     }

@@ -1,25 +1,49 @@
 import SwiftUI
 import Observation
 import AppKit
+import ImageIO
 
-/// Decodes and caches `NSImage`s off the main thread. A tiny LRU keeps the
-/// current image plus the one prefetched image (and the previous, for undo).
+/// Decodes and caches *render-ready* `NSImage`s off the main thread. A tiny LRU
+/// keeps the current image plus the one prefetched image (and the previous, for
+/// undo). Images are fully decoded and downsampled to the display size here, so
+/// the main thread never pays a decode cost when the image is drawn.
 actor ImageCache {
     private var cache: [URL: NSImage] = [:]
     private var order: [URL] = []
     private let limit = 3
 
     @discardableResult
-    func load(_ url: URL) -> NSImage? {
+    func load(_ url: URL, maxPixelSize: Int) -> NSImage? {
         if let existing = cache[url] {
             touch(url)
             return existing
         }
-        guard let image = NSImage(contentsOf: url) else { return nil }
+        guard let image = Self.decode(url, maxPixelSize: maxPixelSize) else { return nil }
         cache[url] = image
         order.append(url)
         trim()
         return image
+    }
+
+    /// Decode to a fully-rasterized, screen-sized image. `CreateThumbnail` +
+    /// `ShouldCacheImmediately` forces the pixel decode to happen now (off the
+    /// main thread), and downsampling a 24MP RAW to screen size is what makes
+    /// this fast. Falls back to `NSImage(contentsOf:)` for anything ImageIO
+    /// can't read.
+    private static func decode(_ url: URL, maxPixelSize: Int) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return NSImage(contentsOf: url)
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return NSImage(contentsOf: url)
+        }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     private func touch(_ url: URL) {
@@ -108,13 +132,19 @@ final class SorterViewModel {
         photos.indices.contains(currentIndex + 1) ? photos[currentIndex + 1] : nil
     }
 
+    /// Longest edge, in pixels, to decode images at. Sized to the screen so a
+    /// 24MP RAW is downsampled instead of fully rasterized. Generous default
+    /// covers a Retina full-screen window until the view reports the real size.
+    var maxPixelSize: Int = 4096
+
     /// Decode the next image in the background so it's ready instantly when the
     /// user advances. Only ever one prefetch is in flight at a time.
     func prefetchNext() {
         prefetchTask?.cancel()
         guard let next = nextURL else { return }
+        let size = maxPixelSize
         prefetchTask = Task.detached(priority: .utility) { [imageCache] in
-            await imageCache.load(next)
+            await imageCache.load(next, maxPixelSize: size)
         }
     }
 
