@@ -147,6 +147,11 @@ struct SorterView: View {
 
             VStack {
                 HStack {
+                    Button("Quit") { NSApp.terminate(nil) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.5))
+                        .padding(12)
                     Spacer()
                     Text(vm.progress)
                         .font(.system(size: 12, design: .monospaced))
@@ -224,6 +229,8 @@ struct DoneView: View {
                 }
                 Button("Sort Another Folder") { vm.reset() }
                     .keyboardShortcut(.return)
+                    .controlSize(.large)
+                Button("Quit") { NSApp.terminate(nil) }
                     .controlSize(.large)
             }
         }
