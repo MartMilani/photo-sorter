@@ -3,24 +3,33 @@ import Observation
 import AppKit
 import ImageIO
 
-/// Decodes and caches *render-ready* `NSImage`s off the main thread. A tiny LRU
-/// keeps the current image plus the one prefetched image (and the previous, for
-/// undo). Images are fully decoded and downsampled to the display size here, so
-/// the main thread never pays a decode cost when the image is drawn.
+/// Decodes and caches *render-ready* `NSImage`s off the main thread. A
+/// byte-budgeted LRU keeps as many decoded neighbours as fit under `budget`,
+/// so two-way browsing stays instant while memory stays bounded regardless of
+/// display size (a screen-sized RAW decode is tens of MB). Images are fully
+/// decoded and downsampled to the display size here, so the main thread never
+/// pays a decode cost when the image is drawn.
 actor ImageCache {
-    private var cache: [URL: NSImage] = [:]
-    private var order: [URL] = []
-    private let limit = 3
+    private struct Entry { let image: NSImage; let bytes: Int }
+
+    private var cache: [URL: Entry] = [:]
+    private var order: [URL] = []        // least- to most-recently used
+    private var totalBytes = 0
+
+    /// Soft ceiling on resident decoded pixels. ~1 GB leaves a generous window
+    /// of neighbours cached on either side while keeping the footprint bounded.
+    private let budget = 1_024 * 1_024 * 1_024
 
     @discardableResult
     func load(_ url: URL, maxPixelSize: Int) -> NSImage? {
         if let existing = cache[url] {
             touch(url)
-            return existing
+            return existing.image
         }
-        guard let image = Self.decode(url, maxPixelSize: maxPixelSize) else { return nil }
-        cache[url] = image
+        guard let (image, bytes) = Self.decode(url, maxPixelSize: maxPixelSize) else { return nil }
+        cache[url] = Entry(image: image, bytes: bytes)
         order.append(url)
+        totalBytes += bytes
         trim()
         return image
     }
@@ -29,10 +38,10 @@ actor ImageCache {
     /// `ShouldCacheImmediately` forces the pixel decode to happen now (off the
     /// main thread), and downsampling a 24MP RAW to screen size is what makes
     /// this fast. Falls back to `NSImage(contentsOf:)` for anything ImageIO
-    /// can't read.
-    private static func decode(_ url: URL, maxPixelSize: Int) -> NSImage? {
+    /// can't read. Returns the image and an estimate of its resident bytes.
+    private static func decode(_ url: URL, maxPixelSize: Int) -> (NSImage, Int)? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            return NSImage(contentsOf: url)
+            return NSImage(contentsOf: url).map { ($0, estimatedBytes($0)) }
         }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -41,9 +50,14 @@ actor ImageCache {
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return NSImage(contentsOf: url)
+            return NSImage(contentsOf: url).map { ($0, estimatedBytes($0)) }
         }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return (image, cg.width * cg.height * 4)   // 4 bytes/pixel (RGBA8)
+    }
+
+    private static func estimatedBytes(_ image: NSImage) -> Int {
+        Int(image.size.width * image.size.height) * 4
     }
 
     private func touch(_ url: URL) {
@@ -53,9 +67,12 @@ actor ImageCache {
         }
     }
 
+    /// Evict least-recently-used entries until under budget, but always keep at
+    /// least the most recent entry so the visible image is never dropped.
     private func trim() {
-        while order.count > limit {
-            cache.removeValue(forKey: order.removeFirst())
+        while totalBytes > budget, order.count > 1 {
+            let evicted = order.removeFirst()
+            totalBytes -= cache.removeValue(forKey: evicted)?.bytes ?? 0
         }
     }
 }
@@ -65,16 +82,89 @@ enum PhotoFormat: String, CaseIterable {
     case compressed, raw
 }
 
+/// The bucket a photo can be sorted into. Raw value is also the folder name.
+enum Category: String, CaseIterable {
+    case good, maybe, bad
+}
+
+/// What a single sorted photo became on disk: its category and the file(s) the
+/// app copied into that category folder (used for re-sort and undo).
+struct SortRecord {
+    var category: Category
+    var destinations: [URL]
+}
+
+/// Persisted record of a sorting session, rewritten on every decision and on
+/// quit. Lives at `<destination>/manifest.json`.
+struct Manifest: Codable {
+    var folderName: String
+    var sourceFolder: String
+    var updated: Date
+    var sorted: [Entry]
+    var unsorted: [String]
+
+    struct Entry: Codable {
+        var photo: String
+        var category: String
+        var copies: [String]
+    }
+}
+
 @main
 struct PhotoSorterApp: App {
-    @State private var vm = SorterViewModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
         WindowGroup {
-            ContentView(vm: vm)
+            ContentView(vm: delegate.vm)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1200, height: 800)
+    }
+}
+
+/// Owns the single `SorterViewModel` (shared with the UI) so we can intercept
+/// quit — both ⌘Q / the menu and the in-app "Quit" button route through
+/// `NSApp.terminate`, so `applicationShouldTerminate` catches every path.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let vm = SorterViewModel()
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        vm.writeManifest()
+
+        let pending = vm.unsortedFilenames
+        guard !pending.isEmpty else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.messageText = "\(pending.count) photo\(pending.count == 1 ? "" : "s") still unsorted"
+        alert.informativeText = "These photos haven't been sorted yet. Quit anyway?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Review")       // .alertFirstButtonReturn
+        alert.addButton(withTitle: "Quit Anyway")  // .alertSecondButtonReturn
+        alert.accessoryView = Self.unsortedList(pending)
+
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+    }
+
+    /// Scrollable list of the unsorted filenames, capped so the alert can't grow
+    /// unbounded on a large shoot.
+    private static func unsortedList(_ names: [String]) -> NSView {
+        let cap = 200
+        var shown = names.prefix(cap).joined(separator: "\n")
+        if names.count > cap { shown += "\n…and \(names.count - cap) more" }
+
+        let text = NSTextView()
+        text.string = shown
+        text.isEditable = false
+        text.drawsBackground = false
+        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 360, height: 160))
+        scroll.documentView = text
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        return scroll
     }
 }
 
@@ -84,6 +174,10 @@ final class SorterViewModel {
     var photos: [URL] = []
     var currentIndex: Int = 0
     var isComplete: Bool = false
+
+    /// Per-photo decision: display URL → where it was sorted. Drives the color
+    /// strip, the current-photo badge, the counts, and the unsorted list.
+    private(set) var sortStates: [URL: SortRecord] = [:]
 
     /// True once a folder is loaded that looks like RAW+compressed pairs, until
     /// the user picks how to view/copy them. Drives the format-choice screen.
@@ -98,8 +192,11 @@ final class SorterViewModel {
 
     let imageCache = ImageCache()
 
-    private var undoStack: [(source: URL, destinations: [URL])] = []
+    /// Each entry captures enough to fully reverse one decision: the photo, its
+    /// prior record (nil if it was unsorted), and the files just copied.
+    private var undoStack: [(photo: URL, previous: SortRecord?, copied: [URL])] = []
     private var destinationFolderName: String = ""
+    private var sourceFolderURL: URL?
     private var prefetchTask: Task<Void, Never>?
 
     /// Display URL → every file that belongs to that photo (for "copy all").
@@ -128,8 +225,35 @@ final class SorterViewModel {
         photos.indices.contains(currentIndex) ? photos[currentIndex] : nil
     }
 
-    private var nextURL: URL? {
-        photos.indices.contains(currentIndex + 1) ? photos[currentIndex + 1] : nil
+    /// The category a photo has been sorted into, or nil if still pending.
+    func category(for url: URL?) -> Category? {
+        guard let url else { return nil }
+        return sortStates[url]?.category
+    }
+
+    // MARK: Navigation (no file I/O — just moves the cursor)
+
+    func goPrev() { if currentIndex > 0 { currentIndex -= 1 } }
+    func goNext() { if currentIndex < photos.count - 1 { currentIndex += 1 } }
+
+    /// Source filenames of every photo that still has no category.
+    var unsortedFilenames: [String] {
+        photos.filter { sortStates[$0] == nil }.map { $0.lastPathComponent }
+    }
+
+    /// Per-category tallies plus how many remain, for the on-screen readout.
+    var summary: String {
+        var good = 0, maybe = 0, bad = 0
+        for url in photos {
+            switch sortStates[url]?.category {
+            case .good:  good += 1
+            case .maybe: maybe += 1
+            case .bad:   bad += 1
+            case nil:    break
+            }
+        }
+        let left = photos.count - good - maybe - bad
+        return "\(good) ✓ · \(maybe) ? · \(bad) ✗ · \(left) left"
     }
 
     /// Longest edge, in pixels, to decode images at. Sized to the screen so a
@@ -137,14 +261,34 @@ final class SorterViewModel {
     /// covers a Retina full-screen window until the view reports the real size.
     var maxPixelSize: Int = 4096
 
-    /// Decode the next image in the background so it's ready instantly when the
-    /// user advances. Only ever one prefetch is in flight at a time.
-    func prefetchNext() {
+    /// How many neighbours on each side to warm up. The cache's byte budget is
+    /// the real ceiling; this just bounds how far ahead we look.
+    private let prefetchRadius = 3
+
+    /// Decode the neighbours around the current photo in the background so
+    /// browsing either direction is instant. Loads nearest-first (next, prev,
+    /// +2, −2, …) in a single cancellable task, so rapid navigation drops stale
+    /// work and always favours where the user is now.
+    func prefetchAround() {
         prefetchTask?.cancel()
-        guard let next = nextURL else { return }
         let size = maxPixelSize
+        let index = currentIndex
+
+        // Build the nearest-first list of valid neighbour URLs.
+        var targets: [URL] = []
+        for step in 1...prefetchRadius {
+            for offset in [step, -step] {
+                let i = index + offset
+                if photos.indices.contains(i) { targets.append(photos[i]) }
+            }
+        }
+        guard !targets.isEmpty else { return }
+
         prefetchTask = Task.detached(priority: .utility) { [imageCache] in
-            await imageCache.load(next, maxPixelSize: size)
+            for url in targets {
+                if Task.isCancelled { return }
+                await imageCache.load(url, maxPixelSize: size)
+            }
         }
     }
 
@@ -175,6 +319,7 @@ final class SorterViewModel {
     func load(from folder: URL, into folderName: String) {
         loadError = nil
         destinationFolderName = folderName
+        sourceFolderURL = folder
 
         // Never reuse an existing destination — refuse rather than risk mixing
         // new sorted photos into a folder that already has content.
@@ -228,7 +373,8 @@ final class SorterViewModel {
         photos = display.sorted { $0.lastPathComponent < $1.lastPathComponent }
         siblings = sibs
         currentIndex = 0
-        isComplete = photos.isEmpty
+        sortStates = [:]
+        isComplete = false
         undoStack = []
         fileGroups = []
         needsFormatChoice = false
@@ -243,10 +389,36 @@ final class SorterViewModel {
         Array(Set(urls.map { "." + $0.pathExtension.lowercased() })).sorted()
     }
 
-    func sort(into category: String) {
+    func sort(into category: Category) {
         guard let photo = current else { return }
+        let previous = sortStates[photo]
 
-        let folder = destinationBase(for: destinationFolderName).appendingPathComponent(category)
+        // Already in this category — nothing to do.
+        if previous?.category == category { return }
+
+        // Copy into the new category first; only after that succeeds do we delete
+        // the old copies, so a failed copy can never destroy an existing file.
+        let copied = copyGroup(for: photo, into: category)
+        guard !copied.isEmpty else { return }
+
+        if let previous {
+            for dest in previous.destinations {
+                try? FileManager.default.removeItem(at: dest)
+            }
+        }
+
+        sortStates[photo] = SortRecord(category: category, destinations: copied)
+        undoStack.append((photo: photo, previous: previous, copied: copied))
+        recomputeCompletion()
+        writeManifest()
+        // Stay put — the user navigates with the arrow keys.
+    }
+
+    /// Copy a photo's source file(s) into the given category folder, returning
+    /// the destination URLs actually created. Shared by sort and undo-restore.
+    private func copyGroup(for photo: URL, into category: Category) -> [URL] {
+        let folder = destinationBase(for: destinationFolderName)
+            .appendingPathComponent(category.rawValue)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
         let filesToCopy = copyAllFiles ? (siblings[photo] ?? [photo]) : [photo]
@@ -257,10 +429,7 @@ final class SorterViewModel {
                 copied.append(dest)
             }
         }
-
-        guard !copied.isEmpty else { return }
-        undoStack.append((source: photo, destinations: copied))
-        advance()
+        return copied
     }
 
     /// A destination path that does not yet exist, so a copy can never clobber
@@ -279,32 +448,76 @@ final class SorterViewModel {
     }
 
     func undo() {
-        guard let last = undoStack.popLast() else { return }
-        for dest in last.destinations {
+        guard let entry = undoStack.popLast() else { return }
+
+        // Remove the files this decision wrote.
+        for dest in entry.copied {
             try? FileManager.default.removeItem(at: dest)
         }
-        if let idx = photos.firstIndex(of: last.source) {
-            currentIndex = idx
-            isComplete = false
+
+        // Restore the prior state: re-copy into the old category if there was
+        // one, otherwise the photo goes back to unsorted.
+        if let previous = entry.previous {
+            let restored = copyGroup(for: entry.photo, into: previous.category)
+            sortStates[entry.photo] = SortRecord(category: previous.category, destinations: restored)
+        } else {
+            sortStates.removeValue(forKey: entry.photo)
         }
+
+        if let idx = photos.firstIndex(of: entry.photo) {
+            currentIndex = idx
+        }
+        recomputeCompletion()
+        writeManifest()
     }
 
     func reset() {
         photos = []
         currentIndex = 0
+        sortStates = [:]
         isComplete = false
         undoStack = []
         siblings = [:]
         fileGroups = []
         needsFormatChoice = false
         loadError = nil
+        sourceFolderURL = nil
     }
 
-    private func advance() {
-        if currentIndex + 1 >= photos.count {
-            isComplete = true
-        } else {
-            currentIndex += 1
+    /// All photos sorted → trigger the Done screen. Recomputed after every
+    /// decision, so undoing one drops back out of "complete".
+    private func recomputeCompletion() {
+        isComplete = !photos.isEmpty && photos.allSatisfy { sortStates[$0] != nil }
+    }
+
+    /// Write the session record next to the sorted output. Rewritten on every
+    /// decision and on quit; skipped when no folder is loaded.
+    func writeManifest() {
+        guard !photos.isEmpty else { return }
+        let base = destinationBase(for: destinationFolderName)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        let sorted = photos.compactMap { photo -> Manifest.Entry? in
+            guard let record = sortStates[photo] else { return nil }
+            return Manifest.Entry(
+                photo: photo.lastPathComponent,
+                category: record.category.rawValue,
+                copies: record.destinations.map { $0.lastPathComponent }
+            )
         }
+
+        let manifest = Manifest(
+            folderName: destinationFolderName,
+            sourceFolder: sourceFolderURL?.path ?? "",
+            updated: Date(),
+            sorted: sorted,
+            unsorted: unsortedFilenames
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(manifest) else { return }
+        try? data.write(to: base.appendingPathComponent("manifest.json"), options: .atomic)
     }
 }

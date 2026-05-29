@@ -179,22 +179,33 @@ struct SorterView: View {
             }
 
             VStack {
-                HStack {
+                HStack(alignment: .top) {
                     Button("Quit") { NSApp.terminate(nil) }
                         .buttonStyle(.plain)
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.5))
                         .padding(12)
                     Spacer()
-                    Text(vm.progress)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.5))
-                        .padding(12)
+                    if let category = vm.category(for: vm.current) {
+                        CategoryBadge(category: category)
+                            .padding(.top, 12)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(vm.progress)
+                        Text(vm.summary)
+                    }
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .padding(12)
                 }
                 Spacer()
-                Text("← bad    ↓ maybe    → good    ⌘Z undo")
+                SortStrip(vm: vm)
+                    .padding(.horizontal, 40)
+                Text("1 bad    2 maybe    3 good    ←/→ browse    ⌘Z undo")
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.25))
+                    .padding(.top, 8)
                     .padding(.bottom, 14)
             }
         }
@@ -215,11 +226,13 @@ struct SorterView: View {
     private func startListening() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             switch event.keyCode {
-            case 123: vm.sort(into: "bad");   return nil  // ←
-            case 124: vm.sort(into: "good");  return nil  // →
-            case 125: vm.sort(into: "maybe"); return nil  // ↓
+            case 18: vm.sort(into: .bad);   return nil  // 1
+            case 19: vm.sort(into: .maybe); return nil  // 2
+            case 20: vm.sort(into: .good);  return nil  // 3
+            case 123: vm.goPrev(); return nil           // ←  browse
+            case 124: vm.goNext(); return nil           // →  browse
             case 6 where event.modifierFlags.contains(.command):
-                vm.undo(); return nil                      // ⌘Z
+                vm.undo(); return nil                    // ⌘Z
             default: return event
             }
         }
@@ -227,6 +240,69 @@ struct SorterView: View {
 
     private func stopListening() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+    }
+}
+
+extension Category {
+    /// Strip / badge colour. good = green, maybe = yellow, bad = red.
+    var color: Color {
+        switch self {
+        case .good:  return .green
+        case .maybe: return .yellow
+        case .bad:   return .red
+        }
+    }
+}
+
+/// A colored pill naming the current photo's category.
+struct CategoryBadge: View {
+    let category: Category
+
+    var body: some View {
+        Text(category.rawValue.uppercased())
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(.black.opacity(0.85))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(category.color))
+    }
+}
+
+/// One proportional segment per photo, colored by its category (grey =
+/// unsorted), with a white cursor at the current index. Drawn with `Canvas`
+/// so it scales to thousands of photos without per-segment view overhead and
+/// without decoding any thumbnails (keeping memory for the image cache).
+struct SortStrip: View {
+    var vm: SorterViewModel
+
+    var body: some View {
+        // Read observable state here in `body` so SwiftUI tracks it and redraws
+        // the Canvas when any of it changes.
+        let photos = vm.photos
+        let states = vm.sortStates
+        let currentIndex = vm.currentIndex
+
+        Canvas { context, size in
+            let n = photos.count
+            guard n > 0 else { return }
+            let w = size.width / CGFloat(n)
+            let gap: CGFloat = w > 3 ? 1 : 0
+
+            for (i, url) in photos.enumerated() {
+                let color = states[url]?.category.color ?? Color.white.opacity(0.18)
+                let rect = CGRect(x: CGFloat(i) * w, y: 0, width: max(w - gap, 0.5), height: size.height)
+                context.fill(Path(rect), with: .color(color))
+            }
+
+            // Current-position cursor: a thin white bar, clamped on screen.
+            let markerW = max(w, 2.5)
+            let markerX = min(max(CGFloat(currentIndex) * w + w / 2 - markerW / 2, 0), size.width - markerW)
+            context.fill(
+                Path(roundedRect: CGRect(x: markerX, y: -1, width: markerW, height: size.height + 2), cornerRadius: 1),
+                with: .color(.white)
+            )
+        }
+        .frame(height: 8)
     }
 }
 
@@ -248,7 +324,7 @@ struct PhotoView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: url) {
             image = await vm.imageCache.load(url, maxPixelSize: vm.maxPixelSize)
-            vm.prefetchNext()
+            vm.prefetchAround()
         }
     }
 }
