@@ -555,8 +555,6 @@ final class SorterViewModel {
     /// decision and on quit; skipped when no folder is loaded.
     func writeManifest() {
         guard !photos.isEmpty else { return }
-        let base = destinationBase(for: destinationFolderName)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
 
         let sorted = photos.compactMap { photo -> Manifest.Entry? in
             guard let record = sortStates[photo] else { return nil }
@@ -567,7 +565,7 @@ final class SorterViewModel {
             )
         }
 
-        let manifest = Manifest(
+        save(Manifest(
             folderName: destinationFolderName,
             sourceFolder: sourceFolderURL?.path ?? "",
             updated: Date(),
@@ -577,8 +575,13 @@ final class SorterViewModel {
             completed: sessionCompleted,
             sorted: sorted,
             unsorted: unsortedFilenames
-        )
+        ))
+    }
 
+    /// Encode and atomically write a manifest to its session folder.
+    private func save(_ manifest: Manifest) {
+        let base = destinationBase(for: manifest.folderName)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
@@ -594,6 +597,14 @@ final class SorterViewModel {
     func markComplete() {
         sessionCompleted = true
         writeManifest()
+    }
+
+    /// Flag any session complete directly from its manifest, without loading it.
+    /// Used by the start-screen list to dismiss a finished session.
+    func markSessionComplete(_ folderName: String) {
+        guard var manifest = readManifest(folderName) else { return }
+        manifest.completed = true
+        save(manifest)
     }
 
     // MARK: - Resume

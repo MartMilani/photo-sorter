@@ -147,6 +147,10 @@ struct PickerView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
+                            Button("Mark Complete") {
+                                vm.markSessionComplete(session.folderName)
+                                refresh()
+                            }
                             Button("Resume") { vm.resume(session.folderName) }
                         }
                         .padding(.horizontal, 12)
