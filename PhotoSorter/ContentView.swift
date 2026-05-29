@@ -5,13 +5,76 @@ struct ContentView: View {
     var vm: SorterViewModel
 
     var body: some View {
-        if vm.photos.isEmpty {
+        if vm.needsFormatChoice {
+            FormatChoiceView(vm: vm)
+        } else if vm.photos.isEmpty {
             PickerView(vm: vm)
         } else if vm.isComplete {
             DoneView(vm: vm)
         } else {
             SorterView(vm: vm)
         }
+    }
+}
+
+// MARK: - RAW + Compressed format choice
+
+struct FormatChoiceView: View {
+    var vm: SorterViewModel
+
+    @State private var viewFormat: PhotoFormat = .compressed
+    @State private var copyAll: Bool = true
+
+    private var rawLabel: String {
+        "RAW" + (vm.detectedRawExts.isEmpty ? "" : " (\(vm.detectedRawExts.joined(separator: ", ")))")
+    }
+    private var compressedLabel: String {
+        "Compressed" + (vm.detectedCompressedExts.isEmpty ? "" : " (\(vm.detectedCompressedExts.joined(separator: ", ")))")
+    }
+
+    var body: some View {
+        VStack(spacing: 22) {
+            VStack(spacing: 6) {
+                Text("RAW + Compressed Pairs")
+                    .font(.system(size: 24, weight: .thin))
+                Text("Found \(vm.pairCount) photos saved in two formats.")
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("View while sorting")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Picker("", selection: $viewFormat) {
+                    Text(compressedLabel).tag(PhotoFormat.compressed)
+                    Text(rawLabel).tag(PhotoFormat.raw)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            .frame(width: 380)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("When sorting, copy")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Picker("", selection: $copyAll) {
+                    Text("Both formats").tag(true)
+                    Text("Only the viewed format").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            .frame(width: 380)
+
+            Button("Start Sorting") {
+                vm.applyFormatChoice(view: viewFormat, copyAll: copyAll)
+            }
+            .keyboardShortcut(.return)
+            .controlSize(.large)
+            .padding(.top, 4)
+        }
+        .frame(width: 500, height: 360)
     }
 }
 
