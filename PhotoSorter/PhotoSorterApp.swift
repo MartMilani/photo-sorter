@@ -104,6 +104,9 @@ struct Manifest: Codable {
     var view: String?        // PhotoFormat raw value; nil → .compressed
     var copyAll: Bool?       // nil → false
     var current: String?     // filename of the photo last viewed
+    /// Set only when the user explicitly marks the session done on quit. An
+    /// unexpected termination never sets it, so the session stays resumable.
+    var completed: Bool?     // nil → not completed
     var sorted: [Entry]
     var unsorted: [String]
 
@@ -144,20 +147,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let vm = SorterViewModel()
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        vm.writeManifest()
+        // No folder open → nothing to record, just quit.
+        guard vm.hasSession else { return .terminateNow }
 
         let pending = vm.unsortedFilenames
-        guard !pending.isEmpty else { return .terminateNow }
+        let total = vm.photos.count
 
         let alert = NSAlert()
-        alert.messageText = "\(pending.count) photo\(pending.count == 1 ? "" : "s") still unsorted"
-        alert.informativeText = "These photos haven't been sorted yet. Quit anyway?"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Review")       // .alertFirstButtonReturn
-        alert.addButton(withTitle: "Quit Anyway")  // .alertSecondButtonReturn
-        alert.accessoryView = Self.unsortedList(pending)
+        alert.alertStyle = pending.isEmpty ? .informational : .warning
+        if pending.isEmpty {
+            alert.messageText = "All \(total) photos sorted"
+        } else {
+            alert.messageText = "\(total - pending.count) of \(total) photos sorted"
+            alert.accessoryView = Self.unsortedList(pending)
+        }
+        alert.informativeText = "Mark this session complete so it won't appear as unfinished next time? "
+            + "If you just quit, you can resume it later."
 
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+        let mark = alert.addButton(withTitle: "Mark Complete & Quit")  // .alertFirstButtonReturn
+        let quit = alert.addButton(withTitle: "Quit")                  // .alertSecondButtonReturn
+        alert.addButton(withTitle: "Cancel")                           // .alertThirdButtonReturn (Esc)
+
+        // Don't let a reflexive Return mark unfinished work complete — when
+        // photos remain unsorted, the safe "Quit (resumable)" is the default.
+        if !pending.isEmpty {
+            mark.keyEquivalent = ""
+            quit.keyEquivalent = "\r"
+        }
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            vm.markComplete()          // sets the flag and persists it
+            return .terminateNow
+        case .alertSecondButtonReturn:
+            vm.writeManifest()         // save latest progress; stays resumable
+            return .terminateNow
+        default:
+            return .terminateCancel    // Cancel — keep working
+        }
     }
 
     /// Scrollable list of the unsorted filenames, capped so the alert can't grow
@@ -218,6 +245,9 @@ final class SorterViewModel {
     /// The view format chosen for this session; persisted so resume can rebuild
     /// the same display list and siblings.
     private var viewFormat: PhotoFormat = .compressed
+    /// Whether the user has explicitly marked this session complete. Persisted
+    /// only on a deliberate quit, so a crash leaves the session resumable.
+    private var sessionCompleted = false
     /// Pending file groups awaiting the user's format choice (one per photo).
     private var fileGroups: [[URL]] = []
 
@@ -398,6 +428,7 @@ final class SorterViewModel {
     private func buildPhotos(from groups: [[URL]], view: PhotoFormat, copyAll: Bool) {
         copyAllFiles = copyAll
         viewFormat = view
+        sessionCompleted = false
         let (display, sibs) = displayList(from: groups, view: view)
         photos = display
         siblings = sibs
@@ -511,6 +542,7 @@ final class SorterViewModel {
         needsFormatChoice = false
         loadError = nil
         sourceFolderURL = nil
+        sessionCompleted = false
     }
 
     /// All photos sorted → trigger the Done screen. Recomputed after every
@@ -542,6 +574,7 @@ final class SorterViewModel {
             view: viewFormat.rawValue,
             copyAll: copyAllFiles,
             current: current?.lastPathComponent,
+            completed: sessionCompleted,
             sorted: sorted,
             unsorted: unsortedFilenames
         )
@@ -551,6 +584,16 @@ final class SorterViewModel {
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(manifest) else { return }
         try? data.write(to: base.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
+    /// Whether a session is currently loaded (a folder of photos is open).
+    var hasSession: Bool { !photos.isEmpty }
+
+    /// Flag the current session done and persist it, so it no longer appears in
+    /// the resume list. Called only from the deliberate quit dialog.
+    func markComplete() {
+        sessionCompleted = true
+        writeManifest()
     }
 
     // MARK: - Resume
@@ -564,8 +607,9 @@ final class SorterViewModel {
         return try? decoder.decode(Manifest.self, from: data)
     }
 
-    /// Every unfinished session under the PhotoSorter root, most recent first.
-    /// Completed shoots (nothing left unsorted) are not offered.
+    /// Every session under the PhotoSorter root that the user hasn't explicitly
+    /// marked complete, most recent first. A session left open by an unexpected
+    /// quit stays here because the completed flag is only set on a clean quit.
     func resumableSessions() -> [ResumableSession] {
         guard let dirs = try? FileManager.default.contentsOfDirectory(
             at: rootURL,
@@ -575,7 +619,7 @@ final class SorterViewModel {
 
         return dirs.compactMap { dir -> ResumableSession? in
             guard let manifest = readManifest(dir.lastPathComponent),
-                  !manifest.unsorted.isEmpty else { return nil }
+                  manifest.completed != true else { return nil }
             return ResumableSession(
                 folderName: manifest.folderName,
                 sortedCount: manifest.sorted.count,
@@ -607,6 +651,7 @@ final class SorterViewModel {
         sourceFolderURL = source
         viewFormat = PhotoFormat(rawValue: manifest.view ?? "") ?? .compressed
         copyAllFiles = manifest.copyAll ?? false
+        sessionCompleted = false   // reopening makes it active again
 
         let (display, sibs) = displayList(from: groups, view: viewFormat)
         photos = display
