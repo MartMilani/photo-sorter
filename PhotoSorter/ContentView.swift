@@ -106,6 +106,13 @@ struct PickerView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 130)
             }
+            if let error = vm.loadError {
+                Text(error)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .frame(width: 420)
+            }
         }
         .frame(width: 500, height: 260)
     }

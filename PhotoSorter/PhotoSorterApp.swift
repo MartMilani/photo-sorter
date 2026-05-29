@@ -68,6 +68,10 @@ final class SorterViewModel {
     var detectedRawExts: [String] = []
     var detectedCompressedExts: [String] = []
 
+    /// Set when a folder can't be loaded (e.g. the destination already exists).
+    /// Shown to the user; cleared on the next pick.
+    var loadError: String?
+
     let imageCache = ImageCache()
 
     private var undoStack: [(source: URL, destinations: [URL])] = []
@@ -120,8 +124,23 @@ final class SorterViewModel {
 
     var canUndo: Bool { !undoStack.isEmpty }
 
+    /// Where sorted photos for this run will be written.
+    private func destinationBase(for folderName: String) -> URL {
+        folderName.isEmpty ? picturesURL : picturesURL.appendingPathComponent(folderName)
+    }
+
     func load(from folder: URL, into folderName: String) {
+        loadError = nil
         destinationFolderName = folderName
+
+        // Never reuse an existing destination — refuse rather than risk mixing
+        // new sorted photos into a folder that already has content.
+        let base = destinationBase(for: folderName)
+        if !folderName.isEmpty, FileManager.default.fileExists(atPath: base.path) {
+            loadError = "A folder named “\(folderName)” already exists in ~/Pictures. Choose a different name to avoid overwriting it."
+            return
+        }
+
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -184,19 +203,13 @@ final class SorterViewModel {
     func sort(into category: String) {
         guard let photo = current else { return }
 
-        let base = destinationFolderName.isEmpty ? picturesURL : picturesURL.appendingPathComponent(destinationFolderName)
-        let folder = base.appendingPathComponent(category)
+        let folder = destinationBase(for: destinationFolderName).appendingPathComponent(category)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
         let filesToCopy = copyAllFiles ? (siblings[photo] ?? [photo]) : [photo]
         var copied: [URL] = []
         for src in filesToCopy {
-            var dest = folder.appendingPathComponent(src.lastPathComponent)
-            if FileManager.default.fileExists(atPath: dest.path) {
-                let stem = src.deletingPathExtension().lastPathComponent
-                let ext = src.pathExtension
-                dest = folder.appendingPathComponent("\(stem)_\(Int(Date().timeIntervalSince1970)).\(ext)")
-            }
+            let dest = uniqueDestination(for: src, in: folder)
             if (try? FileManager.default.copyItem(at: src, to: dest)) != nil {
                 copied.append(dest)
             }
@@ -205,6 +218,21 @@ final class SorterViewModel {
         guard !copied.isEmpty else { return }
         undoStack.append((source: photo, destinations: copied))
         advance()
+    }
+
+    /// A destination path that does not yet exist, so a copy can never clobber
+    /// an existing file. Appends " 2", " 3", … to the stem until one is free.
+    private func uniqueDestination(for src: URL, in folder: URL) -> URL {
+        let stem = src.deletingPathExtension().lastPathComponent
+        let ext = src.pathExtension
+        var candidate = folder.appendingPathComponent(src.lastPathComponent)
+        var n = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let name = ext.isEmpty ? "\(stem) \(n)" : "\(stem) \(n).\(ext)"
+            candidate = folder.appendingPathComponent(name)
+            n += 1
+        }
+        return candidate
     }
 
     func undo() {
@@ -226,6 +254,7 @@ final class SorterViewModel {
         siblings = [:]
         fileGroups = []
         needsFormatChoice = false
+        loadError = nil
     }
 
     private func advance() {
