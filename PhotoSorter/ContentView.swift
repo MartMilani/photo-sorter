@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 struct ContentView: View {
     var vm: SorterViewModel
@@ -88,6 +89,15 @@ struct PickerView: View {
         f.dateFormat = "yyyy-MM-dd"
         return f.string(from: Date())
     }()
+    @State private var nameTaken = false
+
+    // Re-check the destination on disk periodically so feedback stays accurate
+    // even if a folder of the same name appears/disappears outside the app.
+    private let pollTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
+    private var trimmedName: String {
+        folderName.trimmingCharacters(in: .whitespaces)
+    }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -99,22 +109,45 @@ struct PickerView: View {
                 Button("Choose Folder") { pick() }
                     .keyboardShortcut(.return)
                     .controlSize(.large)
-                Text("→  ~/Pictures/")
+                    .disabled(nameTaken || trimmedName.isEmpty)
+                Text("→  ~/Pictures/PhotoSorter/")
                     .foregroundStyle(.tertiary)
                     .font(.system(size: 12))
                 TextField("", text: $folderName)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 130)
             }
-            if let error = vm.loadError {
-                Text(error)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .frame(width: 420)
-            }
+            feedback
         }
         .frame(width: 500, height: 260)
+        .onAppear { refresh() }
+        .onChange(of: folderName) { refresh() }
+        .onReceive(pollTimer) { _ in refresh() }
+    }
+
+    @ViewBuilder
+    private var feedback: some View {
+        if let error = vm.loadError {
+            label(error, color: .red)
+        } else if trimmedName.isEmpty {
+            label("Enter a name for the destination folder.", color: .secondary)
+        } else if nameTaken {
+            label("“\(trimmedName)” already exists — choose a different name.", color: .red)
+        } else {
+            label("“\(trimmedName)” is available.", color: .green)
+        }
+    }
+
+    private func label(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(color)
+            .multilineTextAlignment(.center)
+            .frame(width: 420)
+    }
+
+    private func refresh() {
+        nameTaken = vm.destinationExists(for: folderName)
     }
 
     private func pick() {

@@ -154,9 +154,22 @@ final class SorterViewModel {
 
     var canUndo: Bool { !undoStack.isEmpty }
 
+    /// Root for all sorted output: ~/Pictures/PhotoSorter (created on demand).
+    private var rootURL: URL {
+        picturesURL.appendingPathComponent("PhotoSorter")
+    }
+
     /// Where sorted photos for this run will be written.
     private func destinationBase(for folderName: String) -> URL {
-        folderName.isEmpty ? picturesURL : picturesURL.appendingPathComponent(folderName)
+        folderName.isEmpty ? rootURL : rootURL.appendingPathComponent(folderName)
+    }
+
+    /// Whether a destination folder of this name already exists. Used to give
+    /// the picker live feedback before the user commits to a name.
+    func destinationExists(for folderName: String) -> Bool {
+        let trimmed = folderName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        return FileManager.default.fileExists(atPath: destinationBase(for: trimmed).path)
     }
 
     func load(from folder: URL, into folderName: String) {
@@ -167,7 +180,7 @@ final class SorterViewModel {
         // new sorted photos into a folder that already has content.
         let base = destinationBase(for: folderName)
         if !folderName.isEmpty, FileManager.default.fileExists(atPath: base.path) {
-            loadError = "A folder named “\(folderName)” already exists in ~/Pictures. Choose a different name to avoid overwriting it."
+            loadError = "A folder named “\(folderName)” already exists in ~/Pictures/PhotoSorter. Choose a different name to avoid overwriting it."
             return
         }
 
