@@ -90,6 +90,7 @@ struct PickerView: View {
         return f.string(from: Date())
     }()
     @State private var nameTaken = false
+    @State private var sessions: [ResumableSession] = []
 
     // Re-check the destination on disk periodically so feedback stays accurate
     // even if a folder of the same name appears/disappears outside the app.
@@ -118,11 +119,45 @@ struct PickerView: View {
                     .frame(width: 130)
             }
             feedback
+            resumeSection
         }
-        .frame(width: 500, height: 260)
+        .frame(width: 500, height: sessions.isEmpty ? 260 : 460)
         .onAppear { refresh() }
         .onChange(of: folderName) { refresh() }
         .onReceive(pollTimer) { _ in refresh() }
+    }
+
+    /// Unfinished sessions offered for resuming, shown only when any exist.
+    @ViewBuilder
+    private var resumeSection: some View {
+        if !sessions.isEmpty {
+            Divider().frame(width: 420)
+            Text("Resume a session")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(spacing: 8) {
+                    ForEach(sessions) { session in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.folderName)
+                                    .font(.system(size: 13, weight: .medium))
+                                Text("\(session.sortedCount) / \(session.totalCount) sorted")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Resume") { vm.resume(session.folderName) }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.gray.opacity(0.12)))
+                    }
+                }
+                .padding(.horizontal, 2)
+            }
+            .frame(width: 430, height: 150)
+        }
     }
 
     @ViewBuilder
@@ -148,6 +183,7 @@ struct PickerView: View {
 
     private func refresh() {
         nameTaken = vm.destinationExists(for: folderName)
+        sessions = vm.resumableSessions()
     }
 
     private func pick() {

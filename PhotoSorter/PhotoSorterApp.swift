@@ -95,11 +95,15 @@ struct SortRecord {
 }
 
 /// Persisted record of a sorting session, rewritten on every decision and on
-/// quit. Lives at `<destination>/manifest.json`.
+/// quit. Lives at `<destination>/manifest.json`. The `view`/`copyAll`/`current`
+/// fields are optional so manifests written by older builds still decode.
 struct Manifest: Codable {
     var folderName: String
     var sourceFolder: String
     var updated: Date
+    var view: String?        // PhotoFormat raw value; nil → .compressed
+    var copyAll: Bool?       // nil → false
+    var current: String?     // filename of the photo last viewed
     var sorted: [Entry]
     var unsorted: [String]
 
@@ -108,6 +112,15 @@ struct Manifest: Codable {
         var category: String
         var copies: [String]
     }
+}
+
+/// One unfinished session offered on the start screen for resuming.
+struct ResumableSession: Identifiable {
+    var id: String { folderName }
+    var folderName: String
+    var sortedCount: Int
+    var totalCount: Int
+    var updated: Date
 }
 
 @main
@@ -202,6 +215,9 @@ final class SorterViewModel {
     /// Display URL → every file that belongs to that photo (for "copy all").
     private var siblings: [URL: [URL]] = [:]
     private var copyAllFiles: Bool = false
+    /// The view format chosen for this session; persisted so resume can rebuild
+    /// the same display list and siblings.
+    private var viewFormat: PhotoFormat = .compressed
     /// Pending file groups awaiting the user's format choice (one per photo).
     private var fileGroups: [[URL]] = []
 
@@ -329,20 +345,7 @@ final class SorterViewModel {
             return
         }
 
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: folder,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: .skipsHiddenFiles
-        ) else { return }
-
-        let supported = contents
-            .filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }
-
-        // Group files that share a base name (e.g. IMG_1234.CR2 + IMG_1234.JPG).
-        let groups = Dictionary(grouping: supported) {
-            $0.deletingPathExtension().lastPathComponent.lowercased()
-        }
-        let groupList = groups.values.map { $0 }
+        guard let groupList = scanGroups(in: folder) else { return }
         let pairs = groupList.filter { group in
             group.contains(where: isRaw) && group.contains(where: { !isRaw($0) })
         }
@@ -359,9 +362,27 @@ final class SorterViewModel {
         }
     }
 
-    /// Build the sorting queue from grouped files using the chosen view format.
-    private func buildPhotos(from groups: [[URL]], view: PhotoFormat, copyAll: Bool) {
-        copyAllFiles = copyAll
+    /// Scan a folder into groups of files sharing a base name (e.g.
+    /// IMG_1234.CR2 + IMG_1234.JPG). Returns nil if the folder can't be read.
+    private func scanGroups(in folder: URL) -> [[URL]]? {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: .skipsHiddenFiles
+        ) else { return nil }
+
+        let supported = contents
+            .filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }
+        let groups = Dictionary(grouping: supported) {
+            $0.deletingPathExtension().lastPathComponent.lowercased()
+        }
+        return groups.values.map { $0 }
+    }
+
+    /// Pick the displayed file from each group for the chosen view format and
+    /// map it to its full sibling group. Returns the name-sorted display list
+    /// plus the siblings lookup.
+    private func displayList(from groups: [[URL]], view: PhotoFormat) -> ([URL], [URL: [URL]]) {
         var display: [URL] = []
         var sibs: [URL: [URL]] = [:]
         for group in groups {
@@ -370,7 +391,15 @@ final class SorterViewModel {
             display.append(chosen)
             sibs[chosen] = group
         }
-        photos = display.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return (display.sorted { $0.lastPathComponent < $1.lastPathComponent }, sibs)
+    }
+
+    /// Build a fresh sorting queue from grouped files using the chosen view format.
+    private func buildPhotos(from groups: [[URL]], view: PhotoFormat, copyAll: Bool) {
+        copyAllFiles = copyAll
+        viewFormat = view
+        let (display, sibs) = displayList(from: groups, view: view)
+        photos = display
         siblings = sibs
         currentIndex = 0
         sortStates = [:]
@@ -510,6 +539,9 @@ final class SorterViewModel {
             folderName: destinationFolderName,
             sourceFolder: sourceFolderURL?.path ?? "",
             updated: Date(),
+            view: viewFormat.rawValue,
+            copyAll: copyAllFiles,
+            current: current?.lastPathComponent,
             sorted: sorted,
             unsorted: unsortedFilenames
         )
@@ -519,5 +551,95 @@ final class SorterViewModel {
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(manifest) else { return }
         try? data.write(to: base.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
+    // MARK: - Resume
+
+    /// Read and decode the manifest for a destination folder, if present.
+    private func readManifest(_ folderName: String) -> Manifest? {
+        let url = destinationBase(for: folderName).appendingPathComponent("manifest.json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(Manifest.self, from: data)
+    }
+
+    /// Every unfinished session under the PhotoSorter root, most recent first.
+    /// Completed shoots (nothing left unsorted) are not offered.
+    func resumableSessions() -> [ResumableSession] {
+        guard let dirs = try? FileManager.default.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles
+        ) else { return [] }
+
+        return dirs.compactMap { dir -> ResumableSession? in
+            guard let manifest = readManifest(dir.lastPathComponent),
+                  !manifest.unsorted.isEmpty else { return nil }
+            return ResumableSession(
+                folderName: manifest.folderName,
+                sortedCount: manifest.sorted.count,
+                totalCount: manifest.sorted.count + manifest.unsorted.count,
+                updated: manifest.updated
+            )
+        }
+        .sorted { $0.updated > $1.updated }
+    }
+
+    /// Reopen a previously-saved session: re-scan its source folder, rebuild the
+    /// queue with the same view/copy choices, restore each photo's category, and
+    /// land on the photo last viewed.
+    func resume(_ folderName: String) {
+        loadError = nil
+
+        guard let manifest = readManifest(folderName) else {
+            loadError = "Couldn't read the saved session for “\(folderName)”."
+            return
+        }
+
+        let source = URL(fileURLWithPath: manifest.sourceFolder)
+        guard let groups = scanGroups(in: source) else {
+            loadError = "The original folder for “\(folderName)” could not be found at \(manifest.sourceFolder)."
+            return
+        }
+
+        destinationFolderName = manifest.folderName
+        sourceFolderURL = source
+        viewFormat = PhotoFormat(rawValue: manifest.view ?? "") ?? .compressed
+        copyAllFiles = manifest.copyAll ?? false
+
+        let (display, sibs) = displayList(from: groups, view: viewFormat)
+        photos = display
+        siblings = sibs
+        undoStack = []
+        fileGroups = []
+        needsFormatChoice = false
+
+        // Restore per-photo decisions, matching by filename. Photos in the
+        // manifest but no longer in the source are skipped; new photos stay
+        // unsorted. Destination URLs are rebuilt so re-sort/undo work.
+        let entriesByName = Dictionary(manifest.sorted.map { ($0.photo, $0) }) { first, _ in first }
+        var states: [URL: SortRecord] = [:]
+        for photo in photos {
+            guard let entry = entriesByName[photo.lastPathComponent],
+                  let category = Category(rawValue: entry.category) else { continue }
+            let folder = destinationBase(for: destinationFolderName)
+                .appendingPathComponent(category.rawValue)
+            let destinations = entry.copies.map { folder.appendingPathComponent($0) }
+            states[photo] = SortRecord(category: category, destinations: destinations)
+        }
+        sortStates = states
+
+        // Open on the photo last viewed, else the first unsorted, else the start.
+        if let name = manifest.current,
+           let idx = photos.firstIndex(where: { $0.lastPathComponent == name }) {
+            currentIndex = idx
+        } else if let idx = photos.firstIndex(where: { sortStates[$0] == nil }) {
+            currentIndex = idx
+        } else {
+            currentIndex = 0
+        }
+
+        recomputeCompletion()
     }
 }
